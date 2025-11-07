@@ -1390,7 +1390,10 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
                             };
                             try { recordMessage(); } catch(e) {}
 
-                            // If message is encrypted but lacks key metadata, replace the message with a placeholder
+                            // If message is encrypted but lacks key metadata, DO NOT replace the encrypted payload.
+                            // Preserve the original payload so it can be delivered to offline devices and stored
+                            // for later decryption. Instead, mark the transient message with a keyMissing flag
+                            // and attach a human-visible notice if clients prefer to show it.
                             try {
                                 let parsed = null;
                                 if (typeof payload === 'string') {
@@ -1400,9 +1403,19 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
                                 }
 
                                 if (encryptedFlag && !_hasKeyMetadata(parsed)) {
-                                    transientMsg.message = PLACEHOLDER_KEY_LOST;
                                     transientMsg.keyMissing = true;
-                                    console.warn(`Message ${transientMsg.id} from ${fromId} appears encrypted but missing key metadata. Replacing with placeholder.`);
+                                    transientMsg.keyMissingNotice = PLACEHOLDER_KEY_LOST;
+                                    console.warn(`Message ${transientMsg.id} from ${fromId} appears encrypted but missing key metadata. Preserving payload and marking as keyMissing.`);
+                                    // Notify sender devices that the recipient may be missing keys so the sender
+                                    // can take action (e.g. re-share key metadata or prompt user). This is a
+                                    // lightweight hint; clients should handle key exchange out-of-band.
+                                    try {
+                                        const senderSockets = getClientSockets(fromId);
+                                        const notice = JSON.stringify({ type: 'keyRequest', data: { id: transientMsg.id, toId, note: 'recipient missing key metadata, please provide key or re-share' } });
+                                        for (const s of senderSockets) {
+                                            try { if (s && s.readyState === WebSocket.OPEN) s.send(notice); } catch(e) {}
+                                        }
+                                    } catch (e) { console.error('notify sender keyRequest failed', e); }
                                 }
                             } catch (e) { console.error('key metadata check failed', e); }
 
@@ -1520,6 +1533,42 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
                         }
                         break;
 
+                    case 'key:available':
+                        try {
+                            // A client notifies the server that it has received/provisioned keys.
+                            // Try to deliver any pending messages we have queued for this user.
+                            const targetUser = data.userId ? String(data.userId) : (ws.userId ? String(ws.userId) : null);
+                            if (!targetUser) break;
+                            const queue = pendingMessages.get(targetUser) || [];
+                            if (!queue.length) {
+                                // nothing queued
+                                try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'key:available:ack', data: { userId: targetUser, delivered: 0 } })); } catch(e) {}
+                                break;
+                            }
+                            console.log(`key:available received for ${targetUser}, delivering ${queue.length} queued message(s)`);
+                            for (const m of queue) {
+                                try {
+                                    const sockets = getClientSockets(targetUser);
+                                    for (const s of sockets) {
+                                        try { if (s && s.readyState === WebSocket.OPEN) s.send(JSON.stringify({ type: 'chat', data: m })); } catch(e) { console.error('deliver on keyAvailable error', e); }
+                                    }
+
+                                    // notify original senders about delivery
+                                    try {
+                                        const senders = getClientSockets(m.fromId);
+                                        const confirmStr = JSON.stringify({ type: 'messageConfirmation', data: { id: m.id, status: 'delivered', tempId: m.tempId || null }, note: 'delivered after keys became available' });
+                                        const statusStr = JSON.stringify({ type: 'messageStatus', data: { id: m.id, status: 'delivered' } });
+                                        for (const s of senders) {
+                                            try { if (s && s.readyState === WebSocket.OPEN) { s.send(confirmStr); s.send(statusStr); } } catch(e) {}
+                                        }
+                                    } catch (e) { console.error('notify senders after keyAvailable failed', e); }
+                                } catch (e) { console.error('failed to deliver queued msg on keyAvailable', e); }
+                            }
+                            pendingMessages.delete(targetUser);
+                            try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'key:available:ack', data: { userId: targetUser, delivered: queue.length } })); } catch(e) {}
+                        } catch (e) { console.error('key:available handling error', e); }
+                        break;
+
                     case 'group_chat':
                         try {
                             const fromId = data.fromId ? String(data.fromId) : data.fromId;
@@ -1563,7 +1612,9 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
                             // Persist the group message (stringify objects so DB stores payload correctly)
                             try {
                                 if (db && db.saveGroupMessage) {
-                                    // If encrypted payload and missing key metadata, replace with placeholder
+                                    // If encrypted payload and missing key metadata, do NOT replace the payload.
+                                    // Preserve the original encrypted payload and mark the group message as keyMissing
+                                    // so clients can decide how to display it (placeholder or raw encrypted blob).
                                     try {
                                         let parsed = null;
                                         if (typeof payload === 'string') {
@@ -1572,9 +1623,18 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
                                             parsed = payload;
                                         }
                                         if (data.encrypted && !_hasKeyMetadata(parsed)) {
-                                            // replace payload with placeholder string
-                                            payload = PLACEHOLDER_KEY_LOST;
-                                            console.warn(`Group message from ${fromId} missing key metadata; storing placeholder`);
+                                            // mark the group message without destroying the original payload
+                                            gmsg.keyMissing = true;
+                                            gmsg.keyMissingNotice = PLACEHOLDER_KEY_LOST;
+                                            console.warn(`Group message ${gmsg.id} from ${fromId} missing key metadata; preserving payload and marking as keyMissing.`);
+                                            // Notify the sender's devices to take action (re-share keys or prompt users)
+                                            try {
+                                                const senderSockets = getClientSockets(fromId);
+                                                const notice = JSON.stringify({ type: 'keyRequest', data: { id: gmsg.id, groupId, note: 'one or more members missing key metadata; please provide keys or re-share' } });
+                                                for (const s of senderSockets) {
+                                                    try { if (s && s.readyState === WebSocket.OPEN) s.send(notice); } catch(e) {}
+                                                }
+                                            } catch (e) { console.error('notify sender keyRequest failed', e); }
                                         }
                                     } catch (e) { console.error('group key metadata check failed', e); }
 
